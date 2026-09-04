@@ -75,7 +75,18 @@ export function ConfidenceBadge({
 export function PriorityBadge({
   priority
 }) {
+  // FIXED BUG: backend Patient.priority is only ever "normal" or
+  // "critical" — this map was missing a "normal" entry entirely, so
+  // map[priority] came back undefined for every non-critical patient
+  // (i.e. most patients), and m.tone crashed the whole component with
+  // "Cannot read properties of undefined (reading 'tone')". Added
+  // "normal" and a safe fallback for any other/unexpected value so an
+  // unrecognised priority renders a neutral badge instead of crashing.
   const map = {
+    normal: {
+      tone: "neutral",
+      label: "⚪ Normal"
+    },
     critical: {
       tone: "emergency",
       label: "🚨 Critical"
@@ -93,7 +104,7 @@ export function PriorityBadge({
       label: "🟢 Routine"
     }
   };
-  const m = map[priority];
+  const m = map[priority] || { tone: "neutral", label: priority || "Unknown" };
   return <Badge tone={m.tone}>{m.label}</Badge>;
 }
 export function EmptyState({

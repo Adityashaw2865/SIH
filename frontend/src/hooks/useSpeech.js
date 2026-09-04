@@ -1,250 +1,149 @@
-import { useCallback, useRef, useState } from "react";
+import mongoose, { Schema } from "mongoose";
 
-// Map MediKiosk's language labels (from LanguageSelect.jsx) to BCP-47 locale
-// codes understood by the browser's SpeechSynthesis API.
-export const LANG_TO_BCP47 = {
-  Hindi: "hi-IN",
-  English: "en-IN",
-  Bengali: "bn-IN",
-  Marathi: "mr-IN",
-  Tamil: "ta-IN",
-  Telugu: "te-IN",
-  Kannada: "kn-IN",
-  Gujarati: "gu-IN"
-};
+// ---------------------------------------------------------------------
+// Sub-schemas
+// ---------------------------------------------------------------------
 
-// Backend base URL — reuse the same one the rest of the app talks to.
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:4000";
+// A single "actor did X" entry — used everywhere (registration, consent
+// changes, answers, document uploads, red-flag acknowledgement, doctor
+// assignment, summary generation/edit/verify, HIS push, review toggles).
+const AuditLogEntrySchema = new Schema({
+  actor: { type: String, required: true },
+  action: { type: String, required: true },
+  details: { type: String, default: undefined }
+}, { timestamps: true });
 
-function encodeWav(audioBuffer) {
-  // Encode a mono Float32 AudioBuffer as a 16-bit PCM WAV Blob.
-  const numChannels = 1;
-  const sampleRate = audioBuffer.sampleRate;
-  const samples = audioBuffer.getChannelData(0);
-  const bytesPerSample = 2;
-  const blockAlign = numChannels * bytesPerSample;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
+// One question/answer recorded during the kiosk intake interview.
+const AnswerSchema = new Schema({
+  section: { type: String, required: true },
+  question: { type: String, required: true },
+  answer: { type: Schema.Types.Mixed, required: true },
+  inputMode: { type: String, enum: ["tap", "voice", "type"], default: "tap" }
+}, { timestamps: true });
 
-  const writeStr = (offset, str) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
-  };
+// A red-flag alert raised by checkForRedFlag() in routes/patients.js.
+const RedFlagSchema = new Schema({
+  description: { type: String, required: true },
+  acknowledged: { type: Boolean, default: false }
+}, { timestamps: true });
 
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + dataSize, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bytesPerSample * 8, true);
-  writeStr(36, "data");
-  view.setUint32(40, dataSize, true);
+// One structured field extracted (via OCR + Gemini/rules) from an
+// uploaded document — see services/extractionService.js.
+const DocumentFieldSchema = new Schema({
+  label: {
+    type: String,
+    enum: ["Diagnosis", "Medication", "Dosage", "Frequency", "Doctor", "Date", "Test Name", "Result", "Reference Range"],
+    required: true
+  },
+  value: { type: String, required: true },
+  confidence: { type: Number, default: null },
+  status: { type: String, enum: ["confirmed", "needs-verification", "edited"], default: "needs-verification" }
+}, { timestamps: true });
 
-  let offset = 44;
-  for (let i = 0; i < samples.length; i++, offset += 2) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
+// One uploaded document (prescription, lab report, discharge summary...)
+// with its raw OCR text and extracted fields — see routes/documents.js.
+const DocumentSchema = new Schema({
+  category: { type: String, default: "Other" },
+  originalFilename: { type: String, required: true },
+  storedFilename: { type: String, required: true },
+  mimeType: { type: String, required: true },
+  ocrRawText: { type: String, default: "" },
+  ocrConfidence: { type: Number, default: null },
+  fields: { type: [DocumentFieldSchema], default: [] }
+}, { timestamps: true });
 
-  return new Blob([buffer], { type: "audio/wav" });
-}
+// Patient-level consent flags — see routes/patients.js POST /:id/consent.
+const ConsentsSchema = new Schema({
+  historyCapture: { type: Boolean, default: false },
+  documentProcessing: { type: Boolean, default: false },
+  providerSharing: { type: Boolean, default: false }
+}, { _id: false });
 
-/**
- * Speech-to-text via a self-hosted Whisper model on the backend
- * (see backend/src/services/speechService.js) — free, no API key, no
- * external billing account. Records the mic with MediaRecorder, sends the
- * captured audio to POST /api/speech/transcribe, and returns the transcript.
- *
- * This replaces the browser's built-in SpeechRecognition, which had
- * inconsistent accuracy for Indian languages and only worked in
- * Chrome/Edge.
- */
-export function useSpeechToText(language) {
-  const [listening, setListening] = useState(false);
-  const [error, setError] = useState(null);
-  const mediaRecorderRef = useRef(null);
-  const streamRef = useRef(null);
-  const supported = typeof window !== "undefined" && !!navigator.mediaDevices?.getUserMedia && typeof window.MediaRecorder !== "undefined";
+// A drug-interaction hit found by clinicalSafetyService.findDrugInteractions().
+const DrugInteractionSchema = new Schema({
+  drugA: { type: String, required: true },
+  drugB: { type: String, required: true },
+  severity: { type: String, enum: ["low", "moderate", "high"], required: true },
+  note: { type: String, required: true }
+}, { _id: false });
 
-  const listen = useCallback(() => {
-    return new Promise(async (resolve) => {
-      if (!supported) {
-        setError("Voice input isn't supported in this browser. Please tap an answer instead.");
-        resolve(null);
-        return;
-      }
-      setError(null);
+// An out-of-range lab result found by clinicalSafetyService.findAbnormalValues().
+const AbnormalValueSchema = new Schema({
+  testName: { type: String, required: true },
+  result: { type: String, required: true },
+  referenceRange: { type: String, required: true },
+  flag: { type: String, enum: ["low", "high"], required: true }
+}, { _id: false });
 
-      let stream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      } catch {
-        setError("Microphone access was blocked. Please allow it or tap an answer.");
-        resolve(null);
-        return;
-      }
-      streamRef.current = stream;
+// The doctor-facing clinical summary — see routes/summary.js.
+const SummarySchema = new Schema({
+  chiefComplaint: { type: String, default: "Not recorded" },
+  hpi: { type: String, default: "Not recorded" },
+  pastMedicalHistory: { type: String, default: "Not recorded" },
+  pastSurgicalHistory: { type: String, default: "Not recorded" },
+  investigationFindings: { type: String, default: "Not recorded" },
+  drugHistory: { type: String, default: "Not recorded" },
+  allergies: { type: String, default: "Not recorded" },
+  familyHistory: { type: String, default: "Not recorded" },
+  personalHistory: { type: String, default: "Not recorded" },
+  reviewOfSystems: { type: String, default: "Not recorded" },
+  abnormalValues: { type: [AbnormalValueSchema], default: [] },
+  drugInteractions: { type: [DrugInteractionSchema], default: [] },
+  generatedAt: { type: Date, default: null },
+  verifiedBy: { type: String, default: null },
+  verifiedAt: { type: Date, default: null }
+}, { _id: false });
 
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const chunks = [];
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
+// "Doctor has looked at this record" toggle — see POST /:id/mark-reviewed.
+const ReviewedByDoctorSchema = new Schema({
+  reviewed: { type: Boolean, default: false },
+  reviewedBy: { type: String, default: null },
+  reviewedAt: { type: Date, default: null }
+}, { _id: false });
 
-      recorder.ondataavailable = (e) => chunks.push(e.data);
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        setListening(false);
-        try {
-          const blob = new Blob(chunks, { type: chunks[0]?.type || "audio/webm" });
-          const arrayBuf = await blob.arrayBuffer();
-          const decoded = await audioCtx.decodeAudioData(arrayBuf);
-          const wavBlob = encodeWav(decoded);
+// Outcome of pushing this patient's FHIR bundle to the (simulated) HIS —
+// see routes/summary.js POST /:patientId/push-to-his.
+const HisPushSchema = new Schema({
+  status: { type: String, enum: ["sent", "failed"], default: undefined },
+  transactionId: { type: String, default: undefined },
+  pushedAt: { type: Date, default: undefined },
+  pushedBy: { type: String, default: undefined },
+  errorMessage: { type: String, default: undefined }
+}, { _id: false });
 
-          const formData = new FormData();
-          formData.append("audio", wavBlob, "speech.wav");
-          formData.append("language", language || "English");
+// ---------------------------------------------------------------------
+// Main Patient schema
+// ---------------------------------------------------------------------
 
-          const res = await fetch(`${API_BASE}/api/speech/transcribe`, {
-            method: "POST",
-            body: formData
-          });
-          const json = await res.json();
-          if (!json.success) throw new Error(json.error || "Transcription failed");
-          resolve(json.data.transcript || null);
-        } catch {
-          setError("Couldn't hear that clearly. Please try again or tap an answer.");
-          resolve(null);
-        } finally {
-          audioCtx.close();
-        }
-      };
+const PatientSchema = new Schema({
+  token: { type: String, required: true, unique: true },
+  name: { type: String, required: true },
+  age: { type: Number, default: null },
+  gender: { type: String, default: null },
+  language: { type: String, default: "English" },
+  department: { type: String, default: null },
+  abha: { type: String, default: null },
 
-      setListening(true);
-      recorder.start();
-      // Auto-stop after 6 seconds of recording (one intake answer at a time)
-      setTimeout(() => {
-        if (recorder.state !== "inactive") recorder.stop();
-      }, 6000);
-    });
-  }, [language, supported]);
+  intakeStatus: { type: String, enum: ["in-progress", "complete"], default: "in-progress" },
+  priority: { type: String, enum: ["normal", "critical"], default: "normal" },
+  verificationStatus: { type: String, enum: ["pending", "verified"], default: "pending" },
 
-  const cancel = useCallback(() => {
-    if (mediaRecorderRef.current?.state !== "inactive") {
-      mediaRecorderRef.current?.stop();
-    }
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    setListening(false);
-  }, []);
+  assignedDoctor: { type: String, default: null },
 
-  return { listen, cancel, listening, error, supported };
-}
+  answers: { type: [AnswerSchema], default: [] },
+  redFlags: { type: [RedFlagSchema], default: [] },
+  documents: { type: [DocumentSchema], default: [] },
+  consents: { type: ConsentsSchema, default: () => ({}) },
 
-/**
- * Picks the best available SpeechSynthesis voice for a given BCP-47 locale.
- * Falls back progressively: exact locale -> same language family (e.g. any
- * "hi-*" for "hi-IN") -> English -> browser default (undefined lang, whatever
- * voice the browser picks). This prevents silent failures on machines that
- * don't have every Indian-language voice installed (common on fresh
- * Windows/macOS/Brave/Chrome setups) — something always gets spoken instead
- * of nothing happening.
- */
-function pickVoiceAndLang(targetLang) {
-  const voices = typeof window !== "undefined" && window.speechSynthesis
-    ? window.speechSynthesis.getVoices()
-    : [];
+  // Ayush assessment payload is patient-driven and free-form (see
+  // POST /:id/ayush, which stores req.body as-is) — Mixed is intentional.
+  ayush: { type: Schema.Types.Mixed, default: null },
 
-  if (!voices.length) {
-    // Voices not loaded yet (common on first call) — just use the target
-    // lang and let the browser's default voice handle it.
-    return { voice: null, lang: targetLang };
-  }
+  summary: { type: SummarySchema, default: null },
+  reviewedByDoctor: { type: ReviewedByDoctorSchema, default: () => ({}) },
+  hisPush: { type: HisPushSchema, default: null },
 
-  // 1. Exact match, e.g. "hi-IN"
-  let voice = voices.find(v => v.lang === targetLang);
-  if (voice) return { voice, lang: targetLang };
+  auditLog: { type: [AuditLogEntrySchema], default: [] }
+}, { timestamps: true });
 
-  // 2. Same language family, e.g. any "hi-*" voice for "hi-IN"
-  const langPrefix = targetLang.split("-")[0];
-  voice = voices.find(v => v.lang.startsWith(langPrefix + "-") || v.lang === langPrefix);
-  if (voice) return { voice, lang: voice.lang };
-
-  // 3. Fall back to English (India, then any English)
-  voice = voices.find(v => v.lang === "en-IN") || voices.find(v => v.lang.startsWith("en"));
-  if (voice) return { voice, lang: voice.lang, fellBackToEnglish: true };
-
-  // 4. Last resort — whatever the first available voice is
-  return { voice: voices[0], lang: voices[0]?.lang || targetLang, fellBackToEnglish: true };
-}
-
-/**
- * Text-to-speech via the browser's built-in SpeechSynthesis API — free,
- * no API key. Used to read questions / confirmations aloud for low-literacy
- * or visually-impaired patients.
- *
- * Includes a voice-availability fallback (see pickVoiceAndLang above) so
- * that on devices missing a specific Indian-language voice pack, the app
- * still speaks (in English) instead of silently doing nothing — this can
- * otherwise look like a broken feature during a demo on an unfamiliar machine.
- */
-export function useTextToSpeech() {
-  const [speaking, setSpeaking] = useState(false);
-  const [usedFallback, setUsedFallback] = useState(false);
-  const supported = typeof window !== "undefined" && "speechSynthesis" in window;
-
-  const speak = useCallback((text, language) => {
-    if (!supported || !text) return;
-    window.speechSynthesis.cancel();
-
-    const targetLang = LANG_TO_BCP47[language] || "en-IN";
-    const { voice, lang, fellBackToEnglish } = pickVoiceAndLang(targetLang);
-
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = lang;
-    if (voice) utterance.voice = voice;
-    utterance.rate = 0.95;
-    utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
-    setUsedFallback(!!fellBackToEnglish);
-    window.speechSynthesis.speak(utterance);
-  }, [supported]);
-
-  const stop = useCallback(() => {
-    if (supported) window.speechSynthesis.cancel();
-    setSpeaking(false);
-  }, [supported]);
-
-  return { speak, stop, speaking, supported, usedFallback };
-}
-
-/**
- * Matches a raw spoken transcript against a fixed set of on-screen options
- * (e.g. "Yes" / "No" / "Chest pain"). Uses simple normalized substring
- * matching, which is reliable enough for short clinical-intake answers.
- */
-export function matchSpokenToOption(transcript, options) {
-  if (!transcript || !options?.length) return null;
-  const norm = (s) => s.toLowerCase().trim().replace(/[^\w\s]/g, "");
-  const heard = norm(transcript);
-  // Exact or substring match first
-  let match = options.find((opt) => norm(opt) === heard) || options.find((opt) => heard.includes(norm(opt)) || norm(opt).includes(heard));
-  if (match) return match;
-  // Word-overlap fallback: pick option sharing the most words with what was heard
-  const heardWords = new Set(heard.split(/\s+/).filter(Boolean));
-  let best = null;
-  let bestScore = 0;
-  for (const opt of options) {
-    const optWords = norm(opt).split(/\s+/).filter(Boolean);
-    const score = optWords.filter((w) => heardWords.has(w)).length;
-    if (score > bestScore) {
-      bestScore = score;
-      best = opt;
-    }
-  }
-  return bestScore > 0 ? best : null;
-}
+export const Patient = mongoose.model("Patient", PatientSchema);
