@@ -3,8 +3,28 @@ import multer from "multer";
 import wavDecoder from "node-wav";
 import { transcribeAudio } from "../services/speechService.js";
 
-const upload = multer({ storage: multer.memoryStorage() });
+// FIXED BUG: no fileSize limit was set before — memoryStorage() buffers
+// the whole upload in RAM, so an unbounded audio file could exhaust
+// server memory (DoS). Capped at 15MB, matching the pattern in documents.js.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 }
+});
 export const speechRouter = Router();
+
+// Wrap multer so its errors (e.g. file too large) return the same
+// { code, message } error shape used everywhere else in the app.
+function uploadSingleAudio(req, res, next) {
+  upload.single("audio")(req, res, (err) => {
+    if (err) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "UPLOAD_ERROR", message: err.message || "Unable to upload this audio file." }
+      });
+    }
+    next();
+  });
+}
 
 /**
  * POST /api/speech/transcribe
@@ -14,10 +34,15 @@ export const speechRouter = Router();
  *
  * Returns: { success, data: { transcript } }
  */
-speechRouter.post("/transcribe", upload.single("audio"), async (req, res) => {
+speechRouter.post("/transcribe", uploadSingleAudio, async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ success: false, error: "No audio file uploaded (expected field 'audio')." });
+      // FIXED BUG: error used to be a bare string; now matches the
+      // { code, message } shape used across the rest of the API.
+      return res.status(400).json({
+        success: false,
+        error: { code: "NO_FILE", message: "No audio file uploaded (expected field 'audio')." }
+      });
     }
 
     const { audio, sampleRate } = wavDecoder.decode(req.file.buffer);
@@ -34,7 +59,11 @@ speechRouter.post("/transcribe", upload.single("audio"), async (req, res) => {
     res.json({ success: true, data: { transcript } });
   } catch (err) {
     console.error("Speech transcription failed:", err);
-    res.status(500).json({ success: false, error: "Transcription failed." });
+    // FIXED BUG: same { code, message } shape here too, for consistency.
+    res.status(500).json({
+      success: false,
+      error: { code: "TRANSCRIPTION_FAILED", message: "Transcription failed." }
+    });
   }
 });
 

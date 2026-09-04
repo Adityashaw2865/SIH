@@ -45,6 +45,10 @@ function uploadSingleFile(req, res, next) {
   });
 }
 
+// Allowed values for a document field's review status — restricts the
+// PATCH endpoint below from accepting arbitrary strings.
+const ALLOWED_FIELD_STATUSES = ["needs-verification", "confirmed", "edited"];
+
 // Upload a document, run REAL OCR + extraction pipeline, embed result in the patient document
 documentsRouter.post("/:patientId/upload", uploadSingleFile, async (req, res, next) => {
   const file = req.file;
@@ -55,6 +59,19 @@ documentsRouter.post("/:patientId/upload", uploadSingleFile, async (req, res, ne
       message: "No file uploaded"
     }
   });
+
+  // FIXED BUG: previously the patientId was never checked before running
+  // the full OCR + extraction pipeline, so an invalid/garbage patientId
+  // would still burn CPU on OCR only to fail at the final
+  // findByIdAndUpdate — wasteful and an easy DoS vector. Check first.
+  const patientExists = await Patient.exists({ _id: req.params.patientId });
+  if (!patientExists) {
+    return res.status(404).json({
+      success: false,
+      error: { code: "NOT_FOUND", message: "Patient not found" }
+    });
+  }
+
   let generatedImagePath = null;
   try {
     const {
@@ -155,6 +172,16 @@ documentsRouter.patch("/:patientId/:documentId/fields/:fieldId", async (req, res
       value,
       status
     } = req.body;
+
+    // FIXED BUG: status was accepted as any arbitrary string before —
+    // now restricted to the values the app actually understands.
+    if (status !== undefined && !ALLOWED_FIELD_STATUSES.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "VALIDATION_ERROR", message: `status must be one of: ${ALLOWED_FIELD_STATUSES.join(", ")}` }
+      });
+    }
+
     const patient = await Patient.findById(req.params.patientId);
     if (!patient) return res.status(404).json({
       success: false,

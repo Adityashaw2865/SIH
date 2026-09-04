@@ -99,12 +99,12 @@ summaryRouter.post("/:patientId/generate", requireAuth, requireRole("doctor"), a
       abnormalValues,
       drugInteractions,
       generatedAt: new Date(),
-      // FIX: don't carry forward a stale verification — new/regenerated
+      // Don't carry forward a stale verification — new/regenerated
       // content has not been reviewed by a doctor yet.
       verifiedBy: undefined,
       verifiedAt: undefined
     };
-    // FIX: a freshly (re)generated summary is unreviewed — reset the
+    // A freshly (re)generated summary is unreviewed — reset the
     // patient-level verification flag so the "✓ Verified" badge doesn't
     // keep showing on content nobody has actually confirmed yet.
     patient.verificationStatus = "pending";
@@ -131,17 +131,23 @@ summaryRouter.patch("/:patientId", requireAuth, requireRole("doctor"), async (re
     });
     const setObj = {};
     for (const [k, v] of updates) setObj[`summary.${k}`] = v;
-    // FIX: an edit to an already-verified summary invalidates that
+    // An edit to an already-verified summary invalidates that
     // verification — reset both the summary-level and patient-level flags
     // so the doctor has to re-confirm the edited content.
     setObj["summary.verifiedBy"] = null;
     setObj["summary.verifiedAt"] = null;
     setObj["verificationStatus"] = "pending";
+
+    // FIXED BUG: previously this fell back to a hardcoded fake name
+    // ("Dr. Sharma") when editedBy wasn't sent, corrupting the audit
+    // trail. Now it falls back to the authenticated doctor's real identity.
+    const editorName = req.body.editedBy || req.user?.doctorName || req.user?.username || "Unknown Doctor";
+
     const patient = await Patient.findByIdAndUpdate(req.params.patientId, {
       $set: setObj,
       $push: {
         auditLog: {
-          actor: req.body.editedBy || "Dr. Sharma",
+          actor: editorName,
           action: "summary_edited",
           details: JSON.stringify(updates.map(([k]) => k))
         }
