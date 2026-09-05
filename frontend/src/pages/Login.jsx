@@ -65,7 +65,11 @@ export default function Login() {
       localStorage.setItem("token", token);
       localStorage.setItem("user", JSON.stringify(user));
 
-      if (user.role === "triage") {
+      // FIX: admin accounts were falling into the "else" branch and being
+      // sent to /doctor/dashboard, which has no Manage tab (staff
+      // creation, analytics, users overview). Admins share the Triage
+      // Dashboard with triage staff, so route them there too.
+      if (user.role === "triage" || user.role === "admin") {
         navigate("/triage/dashboard");
       } else {
         navigate("/doctor/dashboard");

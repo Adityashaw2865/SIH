@@ -1,149 +1,157 @@
-import mongoose, { Schema } from "mongoose";
+import { useCallback, useRef, useState } from "react";
+
+// Full language names used throughout the app (IntakeContext / LanguageSelect)
+// mapped to BCP-47 tags for the Web Speech API.
+const LANGUAGE_CODES = {
+  Hindi: "hi-IN",
+  English: "en-IN",
+  Bengali: "bn-IN",
+  Marathi: "mr-IN",
+  Tamil: "ta-IN",
+  Telugu: "te-IN",
+  Kannada: "kn-IN",
+  Gujarati: "gu-IN"
+};
+
+function resolveLangCode(language) {
+  return LANGUAGE_CODES[language] || "en-IN";
+}
 
 // ---------------------------------------------------------------------
-// Sub-schemas
+// Speech-to-text (microphone -> transcript), backed by the browser's
+// SpeechRecognition API. `listen()` starts one recognition pass and
+// resolves with the transcript once the user stops speaking (or null on
+// error/timeout), so callers can just `await listen()`.
 // ---------------------------------------------------------------------
+export function useSpeechToText(language) {
+  const [listening, setListening] = useState(false);
+  const [error, setError] = useState(null);
+  const recognitionRef = useRef(null);
 
-// A single "actor did X" entry — used everywhere (registration, consent
-// changes, answers, document uploads, red-flag acknowledgement, doctor
-// assignment, summary generation/edit/verify, HIS push, review toggles).
-const AuditLogEntrySchema = new Schema({
-  actor: { type: String, required: true },
-  action: { type: String, required: true },
-  details: { type: String, default: undefined }
-}, { timestamps: true });
+  const SpeechRecognition =
+    typeof window !== "undefined" &&
+    (window.SpeechRecognition || window.webkitSpeechRecognition);
+  const supported = !!SpeechRecognition;
 
-// One question/answer recorded during the kiosk intake interview.
-const AnswerSchema = new Schema({
-  section: { type: String, required: true },
-  question: { type: String, required: true },
-  answer: { type: Schema.Types.Mixed, required: true },
-  inputMode: { type: String, enum: ["tap", "voice", "type"], default: "tap" }
-}, { timestamps: true });
+  const listen = useCallback(() => {
+    if (!supported) {
+      setError("Voice input isn't supported in this browser.");
+      return Promise.resolve(null);
+    }
+    if (listening) {
+      return Promise.resolve(null);
+    }
 
-// A red-flag alert raised by checkForRedFlag() in routes/patients.js.
-const RedFlagSchema = new Schema({
-  description: { type: String, required: true },
-  acknowledged: { type: Boolean, default: false }
-}, { timestamps: true });
+    return new Promise(resolve => {
+      const recognition = new SpeechRecognition();
+      recognition.lang = resolveLangCode(language);
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
 
-// One structured field extracted (via OCR + Gemini/rules) from an
-// uploaded document — see services/extractionService.js.
-const DocumentFieldSchema = new Schema({
-  label: {
-    type: String,
-    enum: ["Diagnosis", "Medication", "Dosage", "Frequency", "Doctor", "Date", "Test Name", "Result", "Reference Range"],
-    required: true
-  },
-  value: { type: String, required: true },
-  confidence: { type: Number, default: null },
-  status: { type: String, enum: ["confirmed", "needs-verification", "edited"], default: "needs-verification" }
-}, { timestamps: true });
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        setListening(false);
+        resolve(value);
+      };
 
-// One uploaded document (prescription, lab report, discharge summary...)
-// with its raw OCR text and extracted fields — see routes/documents.js.
-const DocumentSchema = new Schema({
-  category: { type: String, default: "Other" },
-  originalFilename: { type: String, required: true },
-  storedFilename: { type: String, required: true },
-  mimeType: { type: String, required: true },
-  ocrRawText: { type: String, default: "" },
-  ocrConfidence: { type: Number, default: null },
-  fields: { type: [DocumentFieldSchema], default: [] }
-}, { timestamps: true });
+      recognition.onstart = () => {
+        setError(null);
+        setListening(true);
+      };
+      recognition.onresult = event => {
+        const transcript = event.results?.[0]?.[0]?.transcript?.trim() || null;
+        finish(transcript);
+      };
+      recognition.onerror = event => {
+        setError(
+          event.error === "no-speech"
+            ? "Didn't catch that — please try again."
+            : "Couldn't access the microphone. Please check permissions."
+        );
+        finish(null);
+      };
+      recognition.onend = () => finish(null);
 
-// Patient-level consent flags — see routes/patients.js POST /:id/consent.
-const ConsentsSchema = new Schema({
-  historyCapture: { type: Boolean, default: false },
-  documentProcessing: { type: Boolean, default: false },
-  providerSharing: { type: Boolean, default: false }
-}, { _id: false });
+      recognitionRef.current = recognition;
+      try {
+        recognition.start();
+      } catch {
+        setError("Couldn't start voice input. Please try again.");
+        finish(null);
+      }
+    });
+  }, [language, listening, supported, SpeechRecognition]);
 
-// A drug-interaction hit found by clinicalSafetyService.findDrugInteractions().
-const DrugInteractionSchema = new Schema({
-  drugA: { type: String, required: true },
-  drugB: { type: String, required: true },
-  severity: { type: String, enum: ["low", "moderate", "high"], required: true },
-  note: { type: String, required: true }
-}, { _id: false });
-
-// An out-of-range lab result found by clinicalSafetyService.findAbnormalValues().
-const AbnormalValueSchema = new Schema({
-  testName: { type: String, required: true },
-  result: { type: String, required: true },
-  referenceRange: { type: String, required: true },
-  flag: { type: String, enum: ["low", "high"], required: true }
-}, { _id: false });
-
-// The doctor-facing clinical summary — see routes/summary.js.
-const SummarySchema = new Schema({
-  chiefComplaint: { type: String, default: "Not recorded" },
-  hpi: { type: String, default: "Not recorded" },
-  pastMedicalHistory: { type: String, default: "Not recorded" },
-  pastSurgicalHistory: { type: String, default: "Not recorded" },
-  investigationFindings: { type: String, default: "Not recorded" },
-  drugHistory: { type: String, default: "Not recorded" },
-  allergies: { type: String, default: "Not recorded" },
-  familyHistory: { type: String, default: "Not recorded" },
-  personalHistory: { type: String, default: "Not recorded" },
-  reviewOfSystems: { type: String, default: "Not recorded" },
-  abnormalValues: { type: [AbnormalValueSchema], default: [] },
-  drugInteractions: { type: [DrugInteractionSchema], default: [] },
-  generatedAt: { type: Date, default: null },
-  verifiedBy: { type: String, default: null },
-  verifiedAt: { type: Date, default: null }
-}, { _id: false });
-
-// "Doctor has looked at this record" toggle — see POST /:id/mark-reviewed.
-const ReviewedByDoctorSchema = new Schema({
-  reviewed: { type: Boolean, default: false },
-  reviewedBy: { type: String, default: null },
-  reviewedAt: { type: Date, default: null }
-}, { _id: false });
-
-// Outcome of pushing this patient's FHIR bundle to the (simulated) HIS —
-// see routes/summary.js POST /:patientId/push-to-his.
-const HisPushSchema = new Schema({
-  status: { type: String, enum: ["sent", "failed"], default: undefined },
-  transactionId: { type: String, default: undefined },
-  pushedAt: { type: Date, default: undefined },
-  pushedBy: { type: String, default: undefined },
-  errorMessage: { type: String, default: undefined }
-}, { _id: false });
+  return { listen, listening, error, supported };
+}
 
 // ---------------------------------------------------------------------
-// Main Patient schema
+// Text-to-speech, backed by the browser's SpeechSynthesis API.
+// `speak(text, language)` reads the given text aloud in the given
+// full language name (e.g. "Hindi").
 // ---------------------------------------------------------------------
+export function useTextToSpeech() {
+  const [speaking, setSpeaking] = useState(false);
+  const supported = typeof window !== "undefined" && "speechSynthesis" in window;
 
-const PatientSchema = new Schema({
-  token: { type: String, required: true, unique: true },
-  name: { type: String, required: true },
-  age: { type: Number, default: null },
-  gender: { type: String, default: null },
-  language: { type: String, default: "English" },
-  department: { type: String, default: null },
-  abha: { type: String, default: null },
+  const speak = useCallback((text, language) => {
+    if (!supported || !text) return;
+    window.speechSynthesis.cancel(); // don't stack utterances
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = resolveLangCode(language);
+    utterance.onstart = () => setSpeaking(true);
+    utterance.onend = () => setSpeaking(false);
+    utterance.onerror = () => setSpeaking(false);
+    window.speechSynthesis.speak(utterance);
+  }, [supported]);
 
-  intakeStatus: { type: String, enum: ["in-progress", "complete"], default: "in-progress" },
-  priority: { type: String, enum: ["normal", "critical"], default: "normal" },
-  verificationStatus: { type: String, enum: ["pending", "verified"], default: "pending" },
+  return { speak, speaking, supported };
+}
 
-  assignedDoctor: { type: String, default: null },
+// ---------------------------------------------------------------------
+// Matches a raw spoken transcript against a fixed list of tap-able
+// options (e.g. "Yes" / "No" / "Suddenly" / "Gradually"), so a patient
+// can answer a multiple-choice question by voice. Tries, in order:
+//   1. exact (case-insensitive) match
+//   2. transcript containing the option, or option containing the transcript
+//   3. best word-overlap score, if it clears a minimum threshold
+// Returns the matched option string, or null if nothing matched well.
+// ---------------------------------------------------------------------
+function normalize(str) {
+  return str.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, "").trim();
+}
 
-  answers: { type: [AnswerSchema], default: [] },
-  redFlags: { type: [RedFlagSchema], default: [] },
-  documents: { type: [DocumentSchema], default: [] },
-  consents: { type: ConsentsSchema, default: () => ({}) },
+export function matchSpokenToOption(transcript, options) {
+  if (!transcript || !Array.isArray(options) || !options.length) return null;
+  const normTranscript = normalize(transcript);
+  if (!normTranscript) return null;
 
-  // Ayush assessment payload is patient-driven and free-form (see
-  // POST /:id/ayush, which stores req.body as-is) — Mixed is intentional.
-  ayush: { type: Schema.Types.Mixed, default: null },
+  // 1. Exact match
+  const exact = options.find(opt => normalize(opt) === normTranscript);
+  if (exact) return exact;
 
-  summary: { type: SummarySchema, default: null },
-  reviewedByDoctor: { type: ReviewedByDoctorSchema, default: () => ({}) },
-  hisPush: { type: HisPushSchema, default: null },
+  // 2. Substring match either direction
+  const substring = options.find(opt => {
+    const normOpt = normalize(opt);
+    return normOpt && (normTranscript.includes(normOpt) || normOpt.includes(normTranscript));
+  });
+  if (substring) return substring;
 
-  auditLog: { type: [AuditLogEntrySchema], default: [] }
-}, { timestamps: true });
-
-export const Patient = mongoose.model("Patient", PatientSchema);
+  // 3. Word-overlap scoring
+  const transcriptWords = new Set(normTranscript.split(/\s+/).filter(Boolean));
+  let best = null;
+  let bestScore = 0;
+  for (const opt of options) {
+    const optWords = normalize(opt).split(/\s+/).filter(Boolean);
+    if (!optWords.length) continue;
+    const overlap = optWords.filter(w => transcriptWords.has(w)).length;
+    const score = overlap / optWords.length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = opt;
+    }
+  }
+  return bestScore >= 0.5 ? best : null;
+}
