@@ -1,3 +1,4 @@
+// FULL FILE: frontend/src/pages/patient/PatientIntake.jsx
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Mic, Check, Circle, AlertTriangle, Volume2 } from "lucide-react";
@@ -384,7 +385,7 @@ export default function PatientIntake() {
   const [extraNoteText, setExtraNoteText] = useState("");
   const current = flow[stepIndex];
   const currentSectionIdx = sections.indexOf(current.section);
-  const { listen, listening, error: sttError, supported: sttSupported } = useSpeechToText(language);
+  const { listen, listening, error: sttError, supported: sttSupported, stopListening, usingServerFallback } = useSpeechToText(language);
   const { speak, speaking, supported: ttsSupported } = useTextToSpeech();
   const t = useTranslation().patientIntake;
 
@@ -638,6 +639,12 @@ export default function PatientIntake() {
                 animationDelay: `${i * 0.1}s`
               }} />)}
                 </div>
+                {/* This browser has no native SpeechRecognition, so recording
+                    is happening via the server-side Whisper fallback and only
+                    stops when the patient taps this (or after 20s). */}
+                {usingServerFallback && <button onClick={stopListening} className="mt-4 px-4 py-2 rounded-full bg-emergency text-white text-sm font-semibold shadow-soft hover:bg-emergency/90">
+                  {t.stopRecording || "Stop & submit"}
+                </button>}
               </div> : <>
                 {current.options && <div className="grid sm:grid-cols-2 gap-3 mb-6">
                     {current.options.map(opt => <button key={opt} onClick={() => answer(opt)} className="min-h-[52px] bg-white border-2 border-teal-light rounded-xl px-5 py-3 text-left font-semibold text-ink hover:border-teal hover:bg-teal-light/30 transition-colors">

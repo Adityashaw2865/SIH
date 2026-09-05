@@ -1,3 +1,4 @@
+// FULL FILE: backend/src/routes/documents.js
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
@@ -80,10 +81,14 @@ documentsRouter.post("/:patientId/upload", uploadSingleFile, async (req, res, ne
     } = req.body;
     // PDFs can't be OCR'd directly — rasterize the first page to a PNG first.
     const ocrInputPath = file.mimetype === "application/pdf" ? (generatedImagePath = await convertPdfToImage(file.path)) : file.path;
+    // The Gemini vision fallback (see ocrService.js) needs a real image
+    // mime type to send along with the bytes — a rasterized PDF page is
+    // always a PNG regardless of the original file's mimetype.
+    const ocrMimeType = file.mimetype === "application/pdf" ? "image/png" : file.mimetype;
     const {
       text,
       confidence
-    } = await runOcr(ocrInputPath, langs || "eng");
+    } = await runOcr(ocrInputPath, langs || "eng", ocrMimeType);
     const fields = await extractClinicalEntities(text, confidence);
     const patient = await Patient.findByIdAndUpdate(req.params.patientId, {
       $push: {

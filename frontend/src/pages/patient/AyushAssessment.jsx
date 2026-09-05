@@ -1,3 +1,4 @@
+// FULL FILE: frontend/src/pages/patient/AyushAssessment.jsx
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Leaf, Mic, Volume2 } from "lucide-react";
@@ -81,7 +82,7 @@ export default function AyushAssessment() {
   const [index, setIndex] = useState(0);
   const [answers, setAnswers] = useState({});
   const [voiceError, setVoiceError] = useState(null);
-  const { listen, listening, error: sttError, supported: sttSupported } = useSpeechToText(language);
+  const { listen, listening, error: sttError, supported: sttSupported, stopListening, usingServerFallback } = useSpeechToText(language);
   const { speak, speaking, supported: ttsSupported } = useTextToSpeech();
 
   const answer = opt => {
@@ -146,8 +147,17 @@ export default function AyushAssessment() {
             </div>}
 
           <div className="flex items-center justify-center gap-6 text-sm">
-            <button onClick={handleVoiceAnswer} disabled={!sttSupported} className="inline-flex items-center gap-1.5 text-teal font-semibold hover:underline disabled:opacity-40 disabled:cursor-not-allowed">
-              <Mic size={16} className={listening ? "animate-pulse-soft text-emergency" : ""} /> {listening ? t.listening : t.speak}
+            {/* On browsers without native SpeechRecognition (e.g. Firefox),
+                useSpeechToText transparently records via the mic and
+                transcribes on the server instead. That path needs an
+                explicit stop tap rather than stopping itself on silence. */}
+            <button
+              onClick={listening && usingServerFallback ? stopListening : handleVoiceAnswer}
+              disabled={!sttSupported || (listening && !usingServerFallback)}
+              className="inline-flex items-center gap-1.5 text-teal font-semibold hover:underline disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Mic size={16} className={listening ? "animate-pulse-soft text-emergency" : ""} />
+              {listening ? (usingServerFallback ? (t.stopRecording || "Stop & submit") : t.listening) : t.speak}
             </button>
             <button onClick={() => speak(current.q, language)} disabled={!ttsSupported || speaking} className="inline-flex items-center gap-1.5 text-teal font-semibold hover:underline disabled:opacity-40">
               <Volume2 size={16} className={speaking ? "animate-pulse-soft" : ""} /> {t.listen}
