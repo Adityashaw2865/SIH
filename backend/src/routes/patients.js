@@ -436,12 +436,13 @@ patientsRouter.post("/:id/consent", async (req, res, next) => {
     res.json({ success: true, data: serializePatient(patient, doctors) });
   } catch (err) { next(err); }
 });
-// Bug tha: yeh route pehle DO baar define tha (duplicate).
-// Pehle wale (buggy) mein answer push PEHLE hota tha, red-flag check BAAD mein.
-// Isse Chief Complaint wala answer khud apne hi red-flag rules se turant match
-// ho jata tha, jabki uske against koi real symptom answer record hi nahi hua tha.
-// Fix: check-before-push order, aur duplicate route delete kar diya.
 
+// Bug tha: yeh route pehle DO baar define tha (duplicate). Pehle wale
+// (buggy) mein answer push PEHLE hota tha, red-flag check BAAD mein.
+// Isse Chief Complaint wala answer khud apne hi red-flag rules se turant
+// match ho jata tha, jabki uske against koi real symptom answer record hi
+// nahi hua tha. Fix: check-before-push order, aur duplicate route delete
+// kar diya (sirf ek hi definition ab neeche rakhi hai).
 patientsRouter.post("/:id/answers", async (req, res, next) => {
   try {
     const { section, question, answer, inputMode } = req.body;
@@ -465,6 +466,7 @@ patientsRouter.post("/:id/answers", async (req, res, next) => {
     res.status(201).json({ success: true, data: serializePatient(patient, doctors) });
   } catch (err) { next(err); }
 });
+
 patientsRouter.post("/:id/ayush", async (req, res, next) => {
   try {
     const patient = await Patient.findByIdAndUpdate(
@@ -549,33 +551,35 @@ patientsRouter.post("/:id/verify", requireAuth, requireRole("doctor"), async (re
 // Lightweight and independent of the summary verification flow above —
 // a doctor can toggle this the moment they've reviewed the case, whether
 // or not a clinical summary has even been generated yet.
-patientsRouter.post("/:id/answers", async (req, res, next) => {
+//
+// BUG FIX: this route was previously missing entirely — the frontend
+// (DoctorPatientDetail.jsx) already called POST /:id/mark-reviewed, but
+// no matching backend route existed, so every click silently 404'd
+// (swallowed by the frontend's .catch). Added the actual route here.
+patientsRouter.post("/:id/mark-reviewed", requireAuth, requireRole("doctor"), async (req, res, next) => {
   try {
-    const { section, question, answer, inputMode } = req.body;
-    if (!section || !question || answer === undefined) {
-      return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "section, question and answer are required" } });
-    }
-    const patient = await Patient.findById(req.params.id);
+    const { reviewed } = req.body;
+    const isReviewed = !!reviewed;
+    const reviewerName = req.user?.doctorName || req.user?.username || "Unknown Doctor";
+    const patient = await Patient.findByIdAndUpdate(
+      req.params.id,
+      {
+        $set: {
+          "reviewedByDoctor.reviewed": isReviewed,
+          "reviewedByDoctor.reviewedBy": isReviewed ? reviewerName : null,
+          "reviewedByDoctor.reviewedAt": isReviewed ? new Date() : null
+        },
+        $push: {
+          auditLog: {
+            actor: reviewerName,
+            action: isReviewed ? "marked_reviewed" : "unmarked_reviewed"
+          }
+        }
+      },
+      { new: true }
+    );
     if (!patient) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Patient not found" } });
-
-    // FIX: red-flag check ab answer push se PEHLE hota hai. Pehle push ke
-    // baad check hota tha, to agar "Chief Complaint" section ka answer khud
-    // hi is call mein aa raha ho, to checkForRedFlag() us abhi-abhi push kiye
-    // gaye complaint ko turant apne hi rule-set se match karne ki koshish
-    // karta — jabki us complaint ke against abhi tak koi real symptom answer
-    // record hi nahi hua. Ab hum patient.answers ki purani (pre-push) state
-    // pe check karte hain, jo hamesha sahi/consistent complaint dega.
-    const redFlagDescription = checkForRedFlag(patient, section, question, answer);
-    patient.answers.push({ section, question, answer, inputMode: inputMode || "tap" });
-
-    if (redFlagDescription) {
-      patient.redFlags.push({ description: redFlagDescription });
-      patient.priority = "critical";
-    }
-
-    patient.auditLog.push({ actor: "patient", action: "answer_recorded", details: `${section}: ${question}` });
-    await patient.save();
     const doctors = await fetchActiveDoctors();
-    res.status(201).json({ success: true, data: serializePatient(patient, doctors) });
+    res.json({ success: true, data: serializePatient(patient, doctors) });
   } catch (err) { next(err); }
 });
