@@ -436,6 +436,11 @@ patientsRouter.post("/:id/consent", async (req, res, next) => {
     res.json({ success: true, data: serializePatient(patient, doctors) });
   } catch (err) { next(err); }
 });
+// Bug tha: yeh route pehle DO baar define tha (duplicate).
+// Pehle wale (buggy) mein answer push PEHLE hota tha, red-flag check BAAD mein.
+// Isse Chief Complaint wala answer khud apne hi red-flag rules se turant match
+// ho jata tha, jabki uske against koi real symptom answer record hi nahi hua tha.
+// Fix: check-before-push order, aur duplicate route delete kar diya.
 
 patientsRouter.post("/:id/answers", async (req, res, next) => {
   try {
@@ -445,9 +450,10 @@ patientsRouter.post("/:id/answers", async (req, res, next) => {
     }
     const patient = await Patient.findById(req.params.id);
     if (!patient) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Patient not found" } });
-    patient.answers.push({ section, question, answer, inputMode: inputMode || "tap" });
 
     const redFlagDescription = checkForRedFlag(patient, section, question, answer);
+    patient.answers.push({ section, question, answer, inputMode: inputMode || "tap" });
+
     if (redFlagDescription) {
       patient.redFlags.push({ description: redFlagDescription });
       patient.priority = "critical";
@@ -459,7 +465,6 @@ patientsRouter.post("/:id/answers", async (req, res, next) => {
     res.status(201).json({ success: true, data: serializePatient(patient, doctors) });
   } catch (err) { next(err); }
 });
-
 patientsRouter.post("/:id/ayush", async (req, res, next) => {
   try {
     const patient = await Patient.findByIdAndUpdate(
