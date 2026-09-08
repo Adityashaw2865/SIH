@@ -58,18 +58,79 @@ function encodeWav(samples, sampleRate) {
   return new Blob([view], { type: "audio/wav" });
 }
 
-async function recordAndTranscribeViaServer(language, stopSignal) {
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-  const source = audioContext.createMediaStreamSource(stream);
-  const processor = audioContext.createScriptProcessor(4096, 1, 1);
+// Inline AudioWorklet module: just forwards raw Float32 PCM frames from
+// the render thread back to the main thread via port.postMessage. This
+// replaces the deprecated ScriptProcessorNode (still supported everywhere
+// today, but formally deprecated in the Web Audio spec and liable to be
+// removed from browsers eventually) with the modern, non-deprecated
+// AudioWorkletNode equivalent. Built as a Blob URL so we don't need a
+// separate static file served by Vite for one tiny processor.
+const PCM_WORKLET_SOURCE = `
+class PcmRecorderProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const channel = inputs[0]?.[0];
+    if (channel && channel.length) {
+      this.port.postMessage(channel.slice());
+    }
+    return true;
+  }
+}
+registerProcessor("pcm-recorder", PcmRecorderProcessor);
+`;
+
+// Cached across calls so we only ever compile/register the worklet module
+// once per AudioContext-capable page load, rather than re-adding it (and
+// re-fetching the Blob URL) on every single recording.
+let pcmWorkletModuleUrl = null;
+
+async function captureRawPcm(audioContext, source, stopSignal) {
   const chunks = [];
 
-  source.connect(processor);
-  processor.connect(audioContext.destination);
-  processor.onaudioprocess = (e) => {
-    chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
-  };
+  // A recorder node (worklet or script-processor fallback) still needs to
+  // be connected to *something* downstream of the destination for most
+  // browsers to actually pull audio through the graph and fire callbacks.
+  // Route that through a zero-gain node instead of straight to
+  // audioContext.destination, so the patient's own mic input is never
+  // played back out loud (which the previous direct-to-destination wiring
+  // would have caused — an audible feedback/echo bug on devices with
+  // speakers and mic close together, e.g. a kiosk).
+  const silentSink = audioContext.createGain();
+  silentSink.gain.value = 0;
+  silentSink.connect(audioContext.destination);
+
+  let recorderNode;
+  let usingWorklet = false;
+
+  if (audioContext.audioWorklet) {
+    try {
+      if (!pcmWorkletModuleUrl) {
+        const blob = new Blob([PCM_WORKLET_SOURCE], { type: "application/javascript" });
+        pcmWorkletModuleUrl = URL.createObjectURL(blob);
+      }
+      await audioContext.audioWorklet.addModule(pcmWorkletModuleUrl);
+      recorderNode = new AudioWorkletNode(audioContext, "pcm-recorder");
+      recorderNode.port.onmessage = (e) => chunks.push(e.data);
+      usingWorklet = true;
+    } catch {
+      // Some older/locked-down browsers claim to support audioWorklet but
+      // still fail on addModule (e.g. insecure context) — fall through to
+      // the ScriptProcessorNode path below rather than breaking voice
+      // input entirely.
+      recorderNode = null;
+    }
+  }
+
+  if (!recorderNode) {
+    // Deprecated but universally supported fallback for browsers without
+    // (working) AudioWorklet support.
+    recorderNode = audioContext.createScriptProcessor(4096, 1, 1);
+    recorderNode.onaudioprocess = (e) => {
+      chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+  }
+
+  source.connect(recorderNode);
+  recorderNode.connect(silentSink);
 
   // Record until the caller signals stop (e.g. user releases a
   // push-to-talk button), capped at 20s so a forgotten mic doesn't
@@ -82,7 +143,21 @@ async function recordAndTranscribeViaServer(language, stopSignal) {
     });
   });
 
-  processor.disconnect();
+  if (usingWorklet) recorderNode.port.onmessage = null;
+  else recorderNode.onaudioprocess = null;
+  recorderNode.disconnect();
+  silentSink.disconnect();
+
+  return chunks;
+}
+
+async function recordAndTranscribeViaServer(language, stopSignal) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioContext.createMediaStreamSource(stream);
+
+  const chunks = await captureRawPcm(audioContext, source, stopSignal);
+
   source.disconnect();
   stream.getTracks().forEach((t) => t.stop());
   const sampleRate = audioContext.sampleRate;
