@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import wavDecoder from "node-wav";
 import { transcribeAudio } from "../services/speechService.js";
+import { heavyEndpointLimiter } from "../middleware/rateLimit.js";
 
 // FIXED BUG: no fileSize limit was set before — memoryStorage() buffers
 // the whole upload in RAM, so an unbounded audio file could exhaust
@@ -34,7 +35,7 @@ function uploadSingleAudio(req, res, next) {
  *
  * Returns: { success, data: { transcript } }
  */
-speechRouter.post("/transcribe", uploadSingleAudio, async (req, res) => {
+speechRouter.post("/transcribe", heavyEndpointLimiter, uploadSingleAudio, async (req, res) => {
   try {
     if (!req.file) {
       // FIXED BUG: error used to be a bare string; now matches the

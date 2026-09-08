@@ -3,11 +3,13 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import { fileTypeFromFile } from "file-type";
 import { Patient } from "../models/Patient.js";
 import { runOcr } from "../services/ocrService.js";
 import { extractClinicalEntities } from "../services/extractionService.js";
 import { convertPdfToImage, cleanupGeneratedImage } from "../services/pdfService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { heavyEndpointLimiter } from "../middleware/rateLimit.js";
 export const documentsRouter = Router();
 const UPLOAD_DIR = path.join(process.cwd(), "data", "uploads");
 fs.mkdirSync(UPLOAD_DIR, {
@@ -51,7 +53,7 @@ function uploadSingleFile(req, res, next) {
 const ALLOWED_FIELD_STATUSES = ["needs-verification", "confirmed", "edited"];
 
 // Upload a document, run REAL OCR + extraction pipeline, embed result in the patient document
-documentsRouter.post("/:patientId/upload", uploadSingleFile, async (req, res, next) => {
+documentsRouter.post("/:patientId/upload", heavyEndpointLimiter, uploadSingleFile, async (req, res, next) => {
   const file = req.file;
   if (!file) return res.status(400).json({
     success: false,
@@ -67,9 +69,28 @@ documentsRouter.post("/:patientId/upload", uploadSingleFile, async (req, res, ne
   // findByIdAndUpdate — wasteful and an easy DoS vector. Check first.
   const patientExists = await Patient.exists({ _id: req.params.patientId });
   if (!patientExists) {
+    fs.unlink(file.path, () => {});
     return res.status(404).json({
       success: false,
       error: { code: "NOT_FOUND", message: "Patient not found" }
+    });
+  }
+
+  // SECURITY: multer's fileFilter only trusts the client-supplied
+  // mimetype header, which is trivial to spoof (e.g. renaming a .exe to
+  // report.png and setting Content-Type: image/png). Sniff the actual
+  // file bytes (magic numbers) here and reject anything that doesn't
+  // really match an allowed image/PDF format before it ever reaches OCR.
+  const allowedRealTypes = ["png", "jpg", "webp", "pdf"];
+  const detected = await fileTypeFromFile(file.path);
+  if (!detected || !allowedRealTypes.includes(detected.ext)) {
+    fs.unlink(file.path, () => {});
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: "INVALID_FILE_CONTENT",
+        message: "This file's actual content doesn't match a supported image or PDF format."
+      }
     });
   }
 

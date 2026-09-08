@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import helmet from "helmet";
 import cors from "cors";
 import { connectDB } from "./db/connection.js";
 import { patientsRouter } from "./routes/patients.js";
@@ -9,6 +10,7 @@ import { speechRouter } from "./routes/speech.js";
 import { authRouter } from "./routes/auth.js";
 import { kiosksRouter } from "./routes/kiosks.js";
 import { requireAuth } from "./middleware/auth.js";
+import { globalLimiter } from "./middleware/rateLimit.js";
 
 // Safety net: Tesseract.js can, on malformed/unsupported files, emit an
 // internal worker-thread error that Node treats as fatal (crashing the
@@ -23,6 +25,28 @@ process.on("unhandledRejection", (err) => {
 });
 
 const app = express();
+
+app.use(helmet({
+  // Disable CSP by default — this is an API server, not serving HTML;
+  // a strict default CSP can break legitimate JSON/file responses for
+  // some clients. Re-enable/configure if this server ever serves HTML.
+  contentSecurityPolicy: false
+}));
+
+// Fail fast on missing critical secrets instead of crashing later on
+// the first login attempt or silently falling back to localhost CORS
+// in what might actually be a production deploy.
+if (!process.env.JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET is not set. Refusing to start.");
+  process.exit(1);
+}
+if (!process.env.MONGODB_URI) {
+  console.error("FATAL: MONGODB_URI is not set. Refusing to start.");
+  process.exit(1);
+}
+if (!process.env.FRONTEND_URL) {
+  console.warn("WARNING: FRONTEND_URL is not set — CORS is falling back to http://localhost:5173. Set this explicitly in production.");
+}
 
 app.use(cors({
   origin: process.env.FRONTEND_URL || "http://localhost:5173",
@@ -39,6 +63,10 @@ app.get("/api/health", (_req, res) => {
     }
   });
 });
+
+// Baseline rate limit for the whole API (login/upload/transcribe have
+// their own stricter limiters layered on top of this — see rateLimit.js).
+app.use("/api", globalLimiter);
 
 app.use("/api/auth", authRouter);
 

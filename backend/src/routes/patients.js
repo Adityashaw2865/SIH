@@ -3,7 +3,7 @@ import { Patient } from "../models/Patient.js";
 import { Staff } from "../models/Staff.js";
 import { suggestDoctorForComplaint } from "../data/doctors.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
-import { generateOtp, verifyOtp, maskAbha } from "../services/abhaService.js";
+import { generateOtp, verifyOtp, maskAbha, AbhaFlowError } from "../services/abhaService.js";
 
 export const patientsRouter = Router();
 
@@ -110,12 +110,14 @@ patientsRouter.post("/", async (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------
-// ABHA-based existing-patient identification (simulated ABDM flow)
+// ABHA-based existing-patient identification
 // ---------------------------------------------------------------------
-// NOTE: This simulates the ABHA OTP login step — see services/abhaService.js
-// for why, and how to swap it for a real ABDM gateway call later. These
-// routes must stay ABOVE the GET "/:id" route below, or Express would try
-// to treat "abha" as a patient id.
+// Talks to the REAL ABDM Gateway when ABDM_CLIENT_ID/ABDM_CLIENT_SECRET
+// are set (see services/abdmGatewayService.js); otherwise falls back to
+// an in-memory OTP simulation — see services/abhaService.js for the
+// switch logic. Either way this route's contract to the frontend never
+// changes. These routes must stay ABOVE the GET "/:id" route below, or
+// Express would try to treat "abha" as a patient id.
 
 const ABHA_ID_REGEX = /^\d{14}$/;
 
@@ -125,19 +127,24 @@ patientsRouter.post("/abha/send-otp", async (req, res, next) => {
     if (!abha || !ABHA_ID_REGEX.test(abha)) {
       return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Enter a valid 14-digit ABHA number." } });
     }
-    const { otp, expiresInSeconds } = generateOtp(abha);
+    const { otp, expiresInSeconds, mode } = await generateOtp(abha);
     res.json({
       success: true,
       data: {
         maskedTarget: maskAbha(abha),
         expiresInSeconds,
-        // devOtp is only ever returned because there's no real SMS/ABDM
-        // gateway configured yet — see abhaService.js. Remove this once
-        // a real gateway is wired up (ABDM_GATEWAY_URL becomes set).
-        devOtp: process.env.ABDM_GATEWAY_URL ? undefined : otp
+        // devOtp is only ever present in simulated mode (no real ABDM
+        // credentials configured) — never sent once ABDM_CLIENT_ID/
+        // ABDM_CLIENT_SECRET are set, since the OTP goes out via real SMS.
+        devOtp: mode === "simulated" ? otp : undefined
       }
     });
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err instanceof AbhaFlowError) {
+      return res.status(502).json({ success: false, error: { code: err.code, message: err.message } });
+    }
+    next(err);
+  }
 });
 
 patientsRouter.post("/abha/verify-otp", async (req, res, next) => {
@@ -146,7 +153,7 @@ patientsRouter.post("/abha/verify-otp", async (req, res, next) => {
     if (!abha || !otp) {
       return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "abha and otp are required" } });
     }
-    const ok = verifyOtp(abha, otp);
+    const ok = await verifyOtp(abha, otp);
     if (!ok) {
       return res.status(401).json({ success: false, error: { code: "INVALID_OTP", message: "That code is incorrect or has expired. Please try again." } });
     }

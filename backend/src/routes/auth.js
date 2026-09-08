@@ -1,21 +1,31 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { z } from "zod";
 import { Staff } from "../models/Staff.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
+import { loginLimiter, seedAdminLimiter } from "../middleware/rateLimit.js";
 
 export const authRouter = Router();
 
+// Bounds are generous on purpose — this just rejects obviously malformed
+// input (empty strings, huge payloads) before it touches bcrypt/DB.
+const loginSchema = z.object({
+  username: z.string().trim().min(1).max(100),
+  password: z.string().min(1).max(200)
+});
+
 // Login — returns a JWT valid for 12 hours
-authRouter.post("/login", async (req, res, next) => {
+authRouter.post("/login", loginLimiter, async (req, res, next) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password) {
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) {
       return res.status(400).json({
         success: false,
         error: { code: "VALIDATION_ERROR", message: "username and password are required" }
       });
     }
+    const { username, password } = parsed.data;
     const staff = await Staff.findOne({ username: username.toLowerCase().trim() });
     if (!staff) {
       return res.status(401).json({
@@ -61,8 +71,18 @@ authRouter.post("/login", async (req, res, next) => {
 // development/demo, use `node src/scripts/seedDemoData.js` instead — it's
 // idempotent (safe to re-run) and doesn't have the "only if zero staff
 // exist" restriction this route has.
-authRouter.post("/seed-admin", async (req, res, next) => {
+authRouter.post("/seed-admin", seedAdminLimiter, async (req, res, next) => {
   try {
+    // Extra safety gate on top of the "only if zero staff exist" check
+    // below: this route creates an unauthenticated admin account, so it
+    // must be explicitly opted into. Set ALLOW_SEED_ADMIN=true in your
+    // local/demo .env; leave it unset in any real deployment.
+    if (process.env.ALLOW_SEED_ADMIN !== "true") {
+      return res.status(403).json({
+        success: false,
+        error: { code: "DISABLED", message: "This route is disabled. Set ALLOW_SEED_ADMIN=true to enable it for local/demo setup." }
+      });
+    }
     const existing = await Staff.countDocuments();
     if (existing > 0) {
       return res.status(403).json({
